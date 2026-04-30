@@ -120,16 +120,35 @@ func (list *SkipList) Get(key []byte) ([]byte, bool, bool) {
 	return nil, false, false
 }
 
-func (list *SkipList) Iterate() []*node {
-	var res []*node
+type Iterator struct {
+	curr *node
+}
 
+func (list *SkipList) NewIterator() *Iterator {
 	list.rwMu.RLock()
 	defer list.rwMu.RUnlock()
 
-	curr := list.head[0]
-	for curr != nil {
-		res = append(res, curr)
-		curr = curr.next[0]
-	}
-	return res
+	return &Iterator{curr: list.head[0]}
+}
+
+// The iterator functions don't hold a lock and are meant to iterate
+// an immutable memtable
+func (it *Iterator) Valid() bool {
+	return it.curr != nil
+}
+
+func (it *Iterator) Next() {
+	it.curr = it.curr.next[0]
+}
+
+func (it *Iterator) Key() []byte {
+	return it.curr.key
+}
+
+func (it *Iterator) Value() []byte {
+	return it.curr.value
+}
+
+func (it *Iterator) Tombstone() bool {
+	return it.curr.tombstone
 }
