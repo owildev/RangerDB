@@ -59,20 +59,16 @@ type Iterator interface {
 	Tombstone() bool
 }
 
-// Writer writes a memtable iterator to an SSTable file.
-type Writer struct {
-	f     *os.File
-	w     io.Writer
-	index []indexEntry
-	pos   uint64 // current byte offset in file
-}
-
-// Reader reads an SSTable file.
+// TODO
+// Reader reads an SSTable file and caches the index,
+// so that every read doesn't read from disk
 type Reader struct {
 	f     *os.File
 	index []indexEntry
 }
 
+// Write out a memtable to sst
+// TODO, the sst index contains every key, later needs to be made sparse
 func Write(it Iterator, path string) error {
 	var offset int64
 	index := make([]indexEntry, 0, 8)
@@ -146,13 +142,15 @@ func Write(it Iterator, path string) error {
 	return nil
 }
 
-// Returns val, tombstone, found
+// Read a key/value from sst
+// Returns val, tombstone, found, error
 func Read(key []byte, path string) ([]byte, bool, bool, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		slog.Error("sst file open", "key", key, "err", err)
 		return nil, false, false, err
 	}
+	defer f.Close()
 
 	_, err = f.Seek(-footerSize, io.SeekEnd)
 	if err != nil {
@@ -160,8 +158,9 @@ func Read(key []byte, path string) ([]byte, bool, bool, error) {
 		return nil, false, false, err
 	}
 
+	// Read fixed positioned footer
 	var ftr footer
-	err = binary.Read(f, binary.LittleEndian, ftr)
+	err = binary.Read(f, binary.LittleEndian, &ftr)
 	if err != nil {
 		slog.Error("sst file footer read", "key", key, "err", err)
 		return nil, false, false, err
@@ -171,8 +170,8 @@ func Read(key []byte, path string) ([]byte, bool, bool, error) {
 		return nil, false, false, ErrDBCorrupted
 	}
 
+	// Read index from footer's index offset
 	f.Seek(ftr.IndexOffset, io.SeekStart)
-
 	var index []indexEntry
 	r := io.LimitReader(f, int64(ftr.IndexSize))
 	for {
@@ -183,35 +182,84 @@ func Read(key []byte, path string) ([]byte, bool, bool, error) {
 				break
 			}
 			slog.Error("sst index read", "err", err)
+			return nil, false, false, err
 		}
 		key := make([]byte, keyLen)
-		io.ReadFull(r, key)
+		n, err := io.ReadFull(r, key)
+		if err != nil || uint32(n) != keyLen {
+			slog.Error("sst index key read", "err", err)
+			return nil, false, false, err
+		}
 		var offset int64
-		binary.Read(r, binary.LittleEndian, &offset)
+		err = binary.Read(r, binary.LittleEndian, &offset)
+		if err != nil {
+			slog.Error("sst index offset read", "err", err)
+			return nil, false, false, err
+		}
 		index = append(index, indexEntry{key: key, offset: offset})
 	}
 
+	// Binary search for the key in the index
 	idx, found := binSearch(index, key)
 	if !found {
 		return nil, false, false, nil
 	}
+
+	// Read key/value entry from offset in sst
 	off := index[idx].offset
-
 	f.Seek(off, io.SeekStart)
+	var keyL uint32
+	err = binary.Read(f, binary.LittleEndian, &keyL)
+	if err != nil {
+		slog.Error("sst key len read", "err", err)
+		return nil, false, false, err
+	}
+	// Read key
+	keyInSst := make([]byte, keyL)
+	_, err = io.ReadFull(f, keyInSst)
+	if err != nil {
+		slog.Error("sst key read", "err", err)
+		return nil, false, false, err
+	}
 
-	return nil, false, false, nil
+	if !bytes.Equal(keyInSst, key) {
+		return nil, false, false, ErrDBCorrupted
+	}
+	// Read valLen
+	var valL uint32
+	err = binary.Read(f, binary.LittleEndian, &valL)
+	if err != nil {
+		slog.Error("sst val len read", "err", err)
+		return nil, false, false, err
+	}
+	// Read val
+	valInSst := make([]byte, valL)
+	_, err = io.ReadFull(f, valInSst)
+	if err != nil {
+		slog.Error("sst val read", "err", err)
+		return nil, false, false, err
+	}
+	// Read tombstone
+	var tomb bool
+	err = binary.Read(f, binary.LittleEndian, &tomb)
+	if err != nil {
+		slog.Error("sst tombstone read", "err", err)
+		return nil, false, false, err
+	}
+	return valInSst, tomb, true, nil
 }
 
 // Searches for the key in the index
 func binSearch(index []indexEntry, key []byte) (int, bool) {
-	low, mid, high := 0, 0, len(index)-1
+	low, high := 0, len(index)-1
 
-	for low < high {
-		mid = (low + high) / 2
-		if bytes.Compare(key, index[mid].key) < 0 {
+	for low <= high {
+		mid := (low + high) / 2
+		cmp := bytes.Compare(key, index[mid].key)
+		if cmp < 0 {
 			high = mid - 1
 			continue
-		} else if bytes.Compare(key, index[mid].key) > 0 {
+		} else if cmp > 0 {
 			low = mid + 1
 			continue
 		} else {
