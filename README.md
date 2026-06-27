@@ -21,7 +21,7 @@ SSTables, and a working read/write path. A learning project.
 
 ## Build
 
-\`\`\`bash
+```
 go build ./...
 go test ./...
-\`\`\`
+```
